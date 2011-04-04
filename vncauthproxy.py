@@ -222,7 +222,7 @@ class VncAuthProxy(gevent.Greenlet):
             self._cleanup()
 
         if self.connect_str:
-            self.debug "Performing HTTP CONNECT"
+            self.debug("Performing HTTP CONNECT")
             self.server.send("CONNECT %s HTTP/1.1\r\n" % self.connect_str)
             self.server.send("Host: %s:%s\r\n" % (self.daddr, self.dport))
             self.server.send("\r\n")
@@ -421,12 +421,12 @@ if __name__ == '__main__':
 
             options = line.split(':', 4)
             sport, daddr, dport, password = options[0:4]
-            if dport[-1] == "+"
+            if dport[-1] == "+":
                 use_ssl = True
                 dport = dport[0:-1]
             else:
                 use_ssl = False
-            if len(options) > 4
+            if len(options) > 4:
                 connect_str = options[4]
 
             txt = " using SSL" if use_ssl else ""
