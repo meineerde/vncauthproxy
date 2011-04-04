@@ -27,6 +27,7 @@ import gevent
 import rfb
 
 from gevent import socket
+from gevent.ssl import wrap_socket
 from gevent.select import select
 
 class VncAuthProxy(gevent.Greenlet):
@@ -45,7 +46,7 @@ class VncAuthProxy(gevent.Greenlet):
     """
     id = 1
 
-    def __init__(self, sport, daddr, dport, password, connect_timeout=30):
+    def __init__(self, sport, daddr, dport, use_ssl, password, connect_str=None, connect_timeout=30):
         """
         @type sport: int
         @param sport: source port
@@ -53,8 +54,12 @@ class VncAuthProxy(gevent.Greenlet):
         @param daddr: destination address (IPv4, IPv6 or hostname)
         @type dport: int
         @param dport: destination port
+        @type dport: bool
+        @param dport: use an SSL wrapper if true
         @type password: str
         @param password: password to request from the client
+        @type connect_str: str
+        @param password: Optional string to send in a CONNECT request
         @type connect_timeout: int
         @param connect_timeout: how long to wait for client connections
                                 (seconds)
@@ -66,7 +71,9 @@ class VncAuthProxy(gevent.Greenlet):
         self.sport = sport
         self.daddr = daddr
         self.dport = dport
+        self.use_ssl = use_ssl
         self.password = password
+        self.connect_str = connect_str
         self.log = logging
         self.server = None
         self.client = None
@@ -96,7 +103,7 @@ class VncAuthProxy(gevent.Greenlet):
         logging.critical("[C%d] %s" % (self.id, msg))
 
     def __str__(self):
-        return "VncAuthProxy: %d -> %s:%d" % (self.sport, self.daddr, self.dport)
+        return "VncAuthProxy: %d -> %s:%d" % (int(self.sport), self.daddr, int(self.dport))
 
     def _forward(self, source, dest):
         """
@@ -120,7 +127,6 @@ class VncAuthProxy(gevent.Greenlet):
             dest.sendall(d)
         source.close()
         dest.close()
-
 
     def _handshake(self):
         """
@@ -189,6 +195,8 @@ class VncAuthProxy(gevent.Greenlet):
                 af, socktype, proto, canonname, sa = res
                 try:
                     self.server = socket.socket(af, socktype, proto)
+                    if self.use_ssl:
+                        self.server = wrap_socket(self.server)
                 except socket.error, msg:
                     self.server = None
                     continue
@@ -213,15 +221,54 @@ class VncAuthProxy(gevent.Greenlet):
             self.error("Failed to connect to server")
             self._cleanup()
 
-        version = self.server.recv(1024)
-        if not rfb.check_version(version):
-            self.error("Unsupported RFB version: %s" % version.strip())
+        if self.connect_str:
+            self.debug "Performing HTTP CONNECT"
+            self.server.send("CONNECT %s HTTP/1.1\r\n" % self.connect_str)
+            self.server.send("Host: %s:%s\r\n" % (self.daddr, self.dport))
+            self.server.send("\r\n")
+
+            # Read Response
+            buffer = self.server.recv(2048)
+            if "\r\n" in buffer:
+                (line, buffer) = buffer.split("\r\n", 1)
+                if line.split(" ")[1] != "200":
+                    self.error("Error during CONNECT: %s" % line)
+                    self._cleanup()
+                # ignore the rest of the headers
+                while line != "":
+                    if not "\r\n" in buffer:
+                        buffer += self.server.recv(2048)
+                    (line, buffer) = buffer.split("\r\n", 1)
+                self.debug("CONNECT successful")
+            else:
+                self.error("Unexpected response during CONNECT")
+                self._cleanup()
+
+            if len(buffer) >= 11:
+                version = buffer
+            else:
+                version = self.server.recv(1024)
+        else:
+            version = self.server.recv(1024)
+
+        self.debug("Version: %s" % version.strip())
+
+        version = rfb.check_version(version)
+        if not version:
+            self.error("Unsupported RFB version: %s" % version)
             self._cleanup()
 
-        self.server.send(rfb.RFB_VERSION_3_8 + "\n")
+        self.server.send(version + "\n")
 
-        res = self.server.recv(1024)
-        types = rfb.parse_auth_request(res)
+        if version < rfb.RFB_VERSION_3_7:
+            res = self.server.recv(4)
+            types = rfb.from_u32(res)
+
+            types = [types] if not types == 0 else []
+        else:
+            res = self.server.recv(1024)
+            types = rfb.parse_auth_request(res, version)
+
         if not types:
             self.error("Error handshaking with the server")
             self._cleanup()
@@ -234,15 +281,16 @@ class VncAuthProxy(gevent.Greenlet):
             self.error("Error, server demands authentication")
             self._cleanup()
 
-        self.server.send(rfb.to_u8(rfb.RFB_AUTHTYPE_NONE))
+        if version >= rfb.RFB_VERSION_3_7:
+            self.server.send(rfb.to_u8(rfb.RFB_AUTHTYPE_NONE))
 
-        # Check authentication response
-        res = self.server.recv(4)
-        res = rfb.from_u32(res)
+            # Check authentication response
+            res = self.server.recv(4)
+            res = rfb.from_u32(res)
 
-        if res != 0:
-            self.error("Authentication error")
-            self._cleanup()
+            if res != 0:
+                self.error("Authentication error")
+                self._cleanup()
 
         # Bridge client/server connections
         self.workers = [gevent.spawn(self._forward, self.client, self.server),
@@ -362,22 +410,44 @@ if __name__ == '__main__':
             # Control message format:
             # TODO: make this json-based?
             # TODO: support multiple forwardings in the same message?
-            # <source_port>:<destination_address>:<destination_port>:<password>
+            # <source_port>:<destination_address>:<destination_port>:<password>:<connect_str>
             # <password> will be used for MITM authentication of clients
             # connecting to <source_port>, who will subsequently be forwarded
             # to a VNC server at <destination_address>:<destination_port>
-            sport, daddr, dport, password = line.split(':', 3)
-            logging.info("New forwarding [%d -> %s:%d]" %
-                         (int(sport), daddr, int(dport)))
+            # We use an SSL wrapper if you add a "+" to the destination_port.
+            # If the options connect_str is given, we will perform an HTTP
+            # CONNECT before transfering control to the client as required for
+            # Xenserver.
+
+            options = line.split(':', 4)
+            sport, daddr, dport, password = options[0:4]
+            if dport[-1] == "+"
+                use_ssl = True
+                dport = dport[0:-1]
+            else:
+                use_ssl = False
+            if len(options) > 4
+                connect_str = options[4]
+
+            txt = " using SSL" if use_ssl else ""
+            logging.info("New forwarding [%d -> %s:%d%s]" %
+                         (int(sport), daddr, int(dport), txt))
         except:
             logging.warn("Malformed request: %s" % line)
-            client.send("FAILED\n")
-            client.close()
+            try:
+                client.send("FAILED\n")
+                client.close()
+            except:
+                logging.critical("Couldn't close the socket endpoint")
             continue
 
-        client.send("OK\n")
-        VncAuthProxy.spawn(sport, daddr, dport, password, opts.connect_timeout)
-        client.close()
+        try:
+            client.send("OK\n")
+            VncAuthProxy.spawn(sport, daddr, dport, use_ssl, password, connect_str, opts.connect_timeout)
+            client.close()
+        except:
+            logging.critical("Something bad happened during VNC communication")
+
 
     os.unlink(opts.ctrl_socket)
     sys.exit(0)

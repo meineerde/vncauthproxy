@@ -31,8 +31,8 @@ RFB_VERSION_3_8 = "RFB 003.008"
 RFB_VERSION_3_7 = "RFB 003.007"
 RFB_VERSION_3_3 = "RFB 003.003"
 RFB_VALID_VERSIONS = [
-#    RFB_VERSION_3_3,
-#    RFB_VERSION_3_7,
+    RFB_VERSION_3_3,
+    RFB_VERSION_3_7,
     RFB_VERSION_3_8,
 ]
 
@@ -40,7 +40,8 @@ class RfbError(Exception):
     pass
 
 def check_version(version):
-    return version.strip()[:11] in RFB_VALID_VERSIONS
+    version = version.strip()[:11]
+    return version if version in RFB_VALID_VERSIONS else None
 
 def make_auth_request(*auth_methods):
     auth_methods = set(auth_methods)
@@ -49,7 +50,7 @@ def make_auth_request(*auth_methods):
             raise RfbError("Unsupported authentication type: %d" % method)
     return pack('B' + 'B' * len(auth_methods), len(auth_methods), *auth_methods)
 
-def parse_auth_request(request):
+def parse_auth_request(request, version):
     length = unpack('B', request[0])[0]
     if length == 0:
         return []
