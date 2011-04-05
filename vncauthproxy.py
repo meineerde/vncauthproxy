@@ -244,7 +244,7 @@ class VncAuthProxy(gevent.Greenlet):
                 self.error("Unexpected response during CONNECT")
                 self._cleanup()
 
-            if len(buffer) >= 11:
+            if len(buffer) >= len(rfb.RFB_VERSION_3_3 + "\n"):
                 version = buffer
             else:
                 version = self.server.recv(1024)
