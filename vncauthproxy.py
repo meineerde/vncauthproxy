@@ -19,6 +19,7 @@
 # 02110-1301, USA.
 
 
+import json
 import os
 import sys
 import logging
@@ -26,7 +27,7 @@ import gevent
 
 import rfb
 
-from gevent import socket
+from gevent import socket, pywsgi
 from gevent.ssl import wrap_socket
 from gevent.select import select
 
@@ -357,6 +358,75 @@ class VncAuthProxy(gevent.Greenlet):
         self._handshake()
 
 
+def is_unix_socket(str):
+    return ":" not in str
+
+def unix_control_socket(opts):
+    if os.path.exists(opts.ctrl_socket):
+        logging.critical("Socket '%s' already exists" % opts.ctrl_socket)
+        sys.exit(1)
+
+    # TODO: make this tunable? chgrp as well?
+    old_umask = os.umask(0077)
+
+    ctrl = socket.socket(socket.AF_UNIX)
+    ctrl.bind(opts.ctrl_socket)
+
+    os.umask(old_umask)
+
+    ctrl.listen(1)
+    ctrl.setblocking(0)
+
+    server = StreamServer(ctrl, spawn_unix)
+    logging.info("Initialized socket at %s, waiting for control connections" %
+                 opts.ctrl_socket)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.stop
+
+    os.unlink(opts.ctrl_socket)
+
+def web_control_socket(opts):
+    addr, port = opts.ctrl_socket.rsplit(":", 1)
+    addr = addr.strip("[] \t")
+
+    if addr.find(".") >= 0:
+        sock_type = socket.AF_INET
+    else:
+        sock_type = socket.AF_INET6
+
+    ctrl = socket.socket(sock_type)
+    ctrl.bind((addr, int(port)))
+    ctrl.listen(50)
+    ctrl.setblocking(0)
+
+    logging.info("Initialized socket at %s, waiting for control connections" %
+                 opts.ctrl_socket)
+    server = pywsgi.WSGIServer(ctrl, spawn_http, keyfile='server.key', certfile='server.crt')
+    try:
+      server.serve_forever()
+    except KeyboardInterrupt:
+      server.stop()
+
+def spawn_http(env, start_response):
+    if env['PATH_INFO'] == "/":
+        if env['REQUEST_METHOD'] == "POST":
+
+
+
+            result = {"status": "OK"}
+            start_response('202 Accepted', [])
+            return json.dumps(result)
+        else:
+            start_response('405 Method Not Allowed', [
+                ('Content-Type', 'text/html'),
+                ('Allow', 'POST')])
+            return ['<html><body><h1>Method Not Allowed</h1></body></html>']
+    else:
+        start_response('404 Not Found', [('Content-Type', 'text/html')])
+        return ['<h1>Not Found</h1>']
+
 if __name__ == '__main__':
     from optparse import OptionParser
 
@@ -370,84 +440,71 @@ if __name__ == '__main__':
     parser.add_option("-l", "--log", dest="logfile", default=None,
                       help="Write log to FILE instead of stdout",
                       metavar="FILE")
-    parser.add_option("-t", "--connect-timeout", dest="connect_timeout",
-                      default=30, type="int", metavar="SECONDS",
-                      help="How long to listen for clients to forward")
 
     (opts, args) = parser.parse_args(sys.argv[1:])
 
     lvl = logging.DEBUG if opts.debug else logging.INFO
-
     logging.basicConfig(level=lvl, filename=opts.logfile,
                         format="%(asctime)s %(levelname)s: %(message)s",
                         datefmt="%m/%d/%Y %H:%M:%S")
 
-    if os.path.exists(opts.ctrl_socket):
-        logging.critical("Socket '%s' already exists" % opts.ctrl_socket)
-        sys.exit(1)
-
-    # TODO: make this tunable? chgrp as well?
-    old_umask = os.umask(0077)
-
-    ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    ctrl.bind(opts.ctrl_socket)
-
-    os.umask(old_umask)
-
-    ctrl.listen(1)
-    logging.info("Initalized, waiting for control connections at %s" %
-                 opts.ctrl_socket)
-
-    while True:
-        try:
-            client, addr = ctrl.accept()
-        except KeyboardInterrupt:
-            break
-
-        logging.info("New control connection")
-        line = client.recv(1024).strip()
-        try:
-            # Control message format:
-            # TODO: make this json-based?
-            # TODO: support multiple forwardings in the same message?
-            # <source_port>:<destination_address>:<destination_port>:<password>:<connect_str>
-            # <password> will be used for MITM authentication of clients
-            # connecting to <source_port>, who will subsequently be forwarded
-            # to a VNC server at <destination_address>:<destination_port>
-            # We use an SSL wrapper if you add a "+" to the destination_port.
-            # If the options connect_str is given, we will perform an HTTP
-            # CONNECT before transfering control to the client as required for
-            # Xenserver.
-
-            options = line.split(':', 4)
-            sport, daddr, dport, password = options[0:4]
-            if dport[-1] == "+":
-                use_ssl = True
-                dport = dport[0:-1]
-            else:
-                use_ssl = False
-            if len(options) > 4:
-                connect_str = options[4]
-
-            txt = " using SSL" if use_ssl else ""
-            logging.info("New forwarding [%d -> %s:%d%s]" %
-                         (int(sport), daddr, int(dport), txt))
-        except:
-            logging.warn("Malformed request: %s" % line)
-            try:
-                client.send("FAILED\n")
-                client.close()
-            except:
-                logging.critical("Couldn't close the socket endpoint")
-            continue
-
-        try:
-            client.send("OK\n")
-            VncAuthProxy.spawn(sport, daddr, dport, use_ssl, password, connect_str, opts.connect_timeout)
-            client.close()
-        except:
-            logging.critical("Something bad happened during VNC communication")
-
-
-    os.unlink(opts.ctrl_socket)
+    if is_unix_socket(opts.ctrl_socket):
+        unix_control_socket(opts)
+    else:
+        web_control_socket(opts)
+    #
+    #
+    #
+    # while True:
+    #     try:
+    #         client, addr = ctrl.accept()
+    #     except KeyboardInterrupt:
+    #         break
+    #
+    #     logging.info("New control connection")
+    #     line = client.recv(1024).strip()
+    #     try:
+    #         # Control message format:
+    #         # TODO: make this json-based?
+    #         # TODO: support multiple forwardings in the same message?
+    #         # <source_port>:<destination_address>:<destination_port>:<password>:<connect_str>
+    #         # <password> will be used for MITM authentication of clients
+    #         # connecting to <source_port>, who will subsequently be forwarded
+    #         # to a VNC server at <destination_address>:<destination_port>
+    #         # We use an SSL wrapper if you add a "+" to the destination_port.
+    #         # If the options connect_str is given, we will perform an HTTP
+    #         # CONNECT before transfering control to the client as required for
+    #         # Xenserver.
+    #
+    #         options = line.split(':', 4)
+    #         sport, daddr, dport, password = options[0:4]
+    #         if dport[-1] == "+":
+    #             use_ssl = True
+    #             dport = dport[0:-1]
+    #         else:
+    #             use_ssl = False
+    #         if len(options) > 4:
+    #             connect_str = options[4]
+    #
+    #         txt = " using SSL" if use_ssl else ""
+    #         logging.info("New forwarding [%d -> %s:%d%s]" %
+    #                      (int(sport), daddr, int(dport), txt))
+    #     except:
+    #         logging.warn("Malformed request: %s" % line)
+    #         try:
+    #             client.send("FAILED\n")
+    #             client.close()
+    #         except:
+    #             logging.critical("Couldn't close the socket endpoint")
+    #         continue
+    #
+    #     try:
+    #         client.send("OK\n")
+    #         VncAuthProxy.spawn(sport, daddr, dport, use_ssl, password, connect_str, opts.connect_timeout)
+    #         client.close()
+    #     except:
+    #         logging.critical("Something bad happened during VNC communication")
+    #
+    #
+    # os.unlink(opts.ctrl_socket)
     sys.exit(0)
